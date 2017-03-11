@@ -1,7 +1,7 @@
 ---
 layout: page
-title: post lists 
-tagline: 好好学习
+title: Posts 
+tagline: 好好学习 
 ---
 {% include JB/setup %}
 
@@ -10,3 +10,6 @@ tagline: 好好学习
     <li><span>{{ post.date | date_to_string }}</span> &raquo; <a href="{{ BASE_PATH }}{{ post.url }}">{{ post.title }}</a></li>
   {% endfor %}
 </ul>
+
+
+
