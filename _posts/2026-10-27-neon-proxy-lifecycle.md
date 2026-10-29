@@ -1,8 +1,10 @@
 # Neon Proxy：启动、Compute 唤醒与运行期协作
 
-本文用三张时序图说明 Neon Proxy 在整个服务端中的生命周期：平台启动、客户端连接与 Compute 唤醒、正常查询及运行期协作。
+本文用三张阶段时序图说明 Neon Proxy 在整个服务端中的生命周期：平台启动、客户端连接与 Compute 唤醒、正常查询及运行期协作；另补充 SQL 角色变更同步到控制面的交互场景。
 
 本文依据 Neon 开源代码版本 [`fa504217c61bbcaf5c512d75830564541f917f8f`](https://github.com/neondatabase/neon/tree/fa504217c61bbcaf5c512d75830564541f917f8f)，整理于 2026-10-27。平台编排与 ELB 就绪检查属于自建服务的部署设计，不能等同于 Neon 或 Databricks Lakebase 生产环境的完整编排。
+
+更新于 2026-10-29：补充 SQL 角色变更上报、认证缓存联动与事务一致性边界。
 
 ## 组件与职责
 
@@ -16,6 +18,7 @@
 | 管理元数据库 | 保存控制面的权威元数据，与业务 Compute 的生命周期独立 |
 | Compute / compute_ctl | 准备配置与基础数据，启动 Postgres，配置角色和数据库 |
 | PostgreSQL | 解析和执行 SQL，管理事务、锁、MVCC 与会话 |
+| Compute 内的 Neon 扩展 | 捕获角色、数据库 DDL，并在事务提交前向控制面上报变更 |
 | 存储层 | Safekeepers 持久化 WAL，Pageserver 提供数据页，对象存储保存长期数据 |
 
 ## 阶段一：平台与 Proxy 启动
@@ -138,6 +141,63 @@ sequenceDiagram
 - Pub/Sub 不是可靠事件日志，需要结合缓存 TTL、重连恢复或版本校验约束变更生效时间。密码缓存失效也不等于自动终止已有会话。
 - 存储访问是按需发生的；命中本地缓存的读请求不需要每次访问 Pageserver，事务提交则涉及 WAL 持久化。
 
+## 运行期补充：SQL 创建角色如何同步到控制面
+
+用户通过 Proxy 执行 `CREATE ROLE app_user LOGIN PASSWORD '…'` 或 `ALTER ROLE app_user PASSWORD '…'` 时，Proxy 转发 PostgreSQL 协议消息。**捕获并上报角色变更的是 Compute 内的 Neon 扩展**：它通过 `ProcessUtility_hook` 收集变更，再由事务回调向控制面发送 HTTP PATCH。无需让 Proxy 解析 SQL。
+
+下面展示成功路径，省略 ELB。控制面的接收处理需要自建；开源代码可以确认 Compute 的发送逻辑，但不能据此确认商业控制面的内部持久化实现。
+
+```mermaid
+sequenceDiagram
+    participant C as PG客户端
+    participant P as Proxy
+    participant DB as Compute / Postgres + Neon扩展
+    participant CP as 控制面DDL接收接口
+
+    C->>P: CREATE ROLE / ALTER ROLE PASSWORD
+    P->>DB: 转发SQL协议消息
+    DB->>DB: 执行DDL，收集事务内变更
+    Note over DB,CP: PRE_COMMIT阶段上报，本地事务尚未提交
+    DB->>CP: HTTP PATCH，携带角色变更与认证材料
+    CP->>CP: 接收并处理角色元数据（需自建）
+    CP-->>DB: HTTP 200
+    DB->>DB: 继续提交事务，仍可能失败
+    DB-->>P: SQL或COMMIT执行结果
+    P-->>C: 返回结果
+```
+
+显式事务中，上报发生在 `COMMIT` 的提交前阶段；自动提交模式中，发生在该语句所属事务的提交前阶段。子事务的变更会在子事务提交时合并，回滚时丢弃。
+
+### 上报接口与数据
+
+| 项目 | 开源实现中的行为 |
+|---|---|
+| 接收地址 | `neon.console_url` 指定的完整 URL；未配置则跳过上报 |
+| 开关 | `neon.forward_ddl`，默认开启；关闭时跳过上报 |
+| 请求 | HTTP PATCH，JSON；配置 `NEON_CONTROL_PLANE_TOKEN` 时使用 Bearer 认证 |
+| 角色变更 | 创建、删除、重命名及密码修改；不能理解为同步所有角色属性和权限变更 |
+| 角色字段 | `roles` 数组内包含 `op`、`name`；按变更内容附带 `password`、`encrypted_password`、`old_name` |
+| 操作 | `op: set` 表示设置角色状态；`op: del` 表示删除 |
+| 认证材料 | `encrypted_password` 来自 PostgreSQL 实际保存的密码 verifier；`password` 可能携带 SQL 中提供的明文密码或预计算哈希 |
+| 成功判定 | 接收端返回 HTTP 200；其他状态码触发错误 |
+
+控制面应保存与 Compute 一致的 SCRAM verifier，包含相同的 salt、迭代次数和密钥材料，供 Proxy 前端认证使用。仅使用相同明文密码重新生成一份不同 salt 的 verifier，不能满足前后端 SCRAM 密钥复用的要求。上报报文应按凭据处理，使用受保护的传输和接口认证，并避免记录密码字段。
+
+### 与 Redis、Proxy 缓存的联动
+
+控制面接收角色变更后，需要将角色认证元数据更新与阶段三的缓存失效链路接起来：**控制面 → Redis Pub/Sub → 各 Proxy 清除对应角色缓存 → 后续认证重新获取数据**。其中 Proxy 的失效通知消费代码已开源；接收 DDL、更新元数据和发布通知的控制面服务需要自行实现。
+
+这条缓存通知链路不承担 DDL 上报，也不保证与 PostgreSQL 提交原子一致。通知发布时机需要由控制面设计；缓存失效不会自动终止已认证的连接。
+
+### 故障与一致性边界
+
+- **上报失败会影响 DDL 提交。** 单次 HTTP 请求超时为 3 秒；curl 传输错误最多尝试 5 次，失败尝试之间等待约 1 秒。HTTP 非 200 会触发错误，不属于该传输重试循环。启用上报时，最终失败会使正常事务提交失败。
+- **上报成功不保证数据库最终提交。** 上报发生在 `PRE_COMMIT`；控制面可能已经收到变更，而 PostgreSQL 随后提交失败。源码明确说明未处理这一窗口，因此不能把它描述成可靠的“提交后事件”或分布式事务。
+- **控制面需实现幂等与对账。** 网络超时可能发生在接收端已处理请求之后；重试需避免重复副作用。可利用 `compute_ctl` 的 `GET /dbs_and_roles` 获取当前角色、密码 verifier 和数据库信息进行校验修复；该接口是主动查询能力，不会自行完成同步或修复。
+- **避免下发配置形成回环。** `compute_ctl` 在应用控制面配置的相关会话中设置 `neon.forward_ddl = false`，避免由控制面下发的变更再次上报。
+
+对于“Neon Compute 与普通 PostgreSQL 统一接入”的自建场景：Neon Compute 可复用上述扩展发送端，并补齐控制面接收接口；普通 PostgreSQL 不会因接入 Neon Proxy 就自动产生这些上报，需要另外实现角色变更捕获、同步和对账，或统一由管理接口执行角色变更。仅部署 Proxy 不能完成这条控制面闭环。
+
 ## Compute 与 Proxy 的生命周期
 
 | 状态 | 独立接入层 Proxy | Compute 内的 Postgres、local_proxy、PgBouncer |
@@ -159,3 +219,8 @@ Compute 休眠或故障后，原有连接、事务与会话状态不能由 Proxy
 - [查询取消映射](https://github.com/neondatabase/neon/blob/fa504217c61bbcaf5c512d75830564541f917f8f/proxy/src/cancellation.rs)
 - [Redis 缓存失效通知](https://github.com/neondatabase/neon/blob/fa504217c61bbcaf5c512d75830564541f917f8f/proxy/src/redis/notifications.rs)
 - [Compute 启动入口](https://github.com/neondatabase/neon/blob/fa504217c61bbcaf5c512d75830564541f917f8f/compute_tools/src/bin/compute_ctl.rs)
+- [Neon 扩展：DDL 捕获、变更报文与 PRE_COMMIT 上报](https://github.com/neondatabase/neon/blob/fa504217c61bbcaf5c512d75830564541f917f8f/pgxn/neon/neon_ddl_handler.c)
+- [DDL forwarding 回归测试](https://github.com/neondatabase/neon/blob/fa504217c61bbcaf5c512d75830564541f917f8f/test_runner/regress/test_ddl_forwarding.py)
+- [Compute 配置应用与禁用 DDL 回传](https://github.com/neondatabase/neon/blob/fa504217c61bbcaf5c512d75830564541f917f8f/compute_tools/src/compute.rs)
+- [compute_ctl HTTP 路由](https://github.com/neondatabase/neon/blob/fa504217c61bbcaf5c512d75830564541f917f8f/compute_tools/src/http/server.rs)
+- [角色和数据库目录查询](https://github.com/neondatabase/neon/blob/fa504217c61bbcaf5c512d75830564541f917f8f/compute_tools/src/catalog.rs)
